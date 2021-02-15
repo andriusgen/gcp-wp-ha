@@ -8,149 +8,85 @@ provider "google" {
 # Retrieve an access token as the Terraform runner
 data "google_client_config" "provider" {}
 
-data "google_container_cluster" "my_cluster" {
+data "google_container_cluster" "wp-cluster" {
   name     = "my-cluster"
-  location = "europe-west1"
+  location = var.region1
 }
 
 provider "kubernetes" {
- # load_config_file = false
-
-  host  = "https://${data.google_container_cluster.my_cluster.endpoint}"
+  host  = "https://${data.google_container_cluster.wp-cluster.endpoint}"
   token = data.google_client_config.provider.access_token
   cluster_ca_certificate = base64decode(
-    data.google_container_cluster.my_cluster.master_auth[0].cluster_ca_certificate,
+    data.google_container_cluster.wp-cluster.master_auth[0].cluster_ca_certificate,
   )
 }
 
-//Creating First VPC Network
-resource "google_compute_network" "vpc_network_wp_1" {
-  name        = "prod-wp-env"
-  description = "VPC Network for WordPress"
-  project     = var.project_id
-  auto_create_subnetworks = false
+
+//Configuring VPC with a private IP address range
+resource "google_compute_network" "vpc" {
+    name        = "prod-wp-env"
+    description = "VPC Network for WordPress"
+    project     = var.project_id
+    routing_mode            = "GLOBAL"
+    auto_create_subnetworks = true
 }
 
-//Creating Subnetwork for First VPC
-resource "google_compute_subnetwork" "subnetwork_wp_1" {
-  name          = "wp-subnet"
-  ip_cidr_range = "10.2.0.0/16"
-  project       = var.project_id
-  region        = var.region1
-  network       = google_compute_network.vpc_network_wp_1.id
 
-  depends_on = [
-    google_compute_network.vpc_network_wp_1
-  ]
+//Allocating a block of private IP addresses
+resource "google_compute_global_address" "private_ip_block" {
+  name         = "private-ip-block"
+  purpose      = "VPC_PEERING"
+  address_type = "INTERNAL"
+  ip_version   = "IPV4"
+  prefix_length = 20
+  network       = google_compute_network.vpc.self_link
 }
 
-//Creating Firewall for First VPC Network
-resource "google_compute_firewall" "firewall_wp_1" {
-  name    = "wp-firewall"
-  network = google_compute_network.vpc_network_wp_1.name
-
-  allow {
-    protocol = "icmp"
-  }
-
-  allow {
-    protocol = "tcp"
-    ports    = ["80", "8080"]
-  }
-
-  source_tags = ["wp", "wordpress"]
-
-  depends_on = [
-    google_compute_network.vpc_network_wp_1
-  ]
+//Enabling private service account 
+resource "google_service_networking_connection" "private_vpc_connection" {
+  network                 = google_compute_network.vpc.self_link
+  service                 = "servicenetworking.googleapis.com"
+  reserved_peering_ranges = [google_compute_global_address.private_ip_block.name]
 }
 
-//Creating Second VPC Network
-resource "google_compute_network" "vpc_network_wp_2" {
-  name        = "prod-db-env"
-  description = "VPC Network For dataBase"
-  project     = var.project_id
-  auto_create_subnetworks = false
-}
 
-//Creating Network For Second VPC
-resource "google_compute_subnetwork" "subnetwork_wp_2" {
-  name          = "db-subnet"
-  ip_cidr_range = "10.4.0.0/16"
-  project       = var.project_id
-  region        = var.region2
-  network       = google_compute_network.vpc_network_wp_2.id
-
-  depends_on = [
-    google_compute_network.vpc_network_wp_2
-  ]
-}
-
-//Creating Firewall for Second VPC Network
-resource "google_compute_firewall" "firewall_wp_2" {
-  name    = "db-firewall"
-  network = google_compute_network.vpc_network_wp_2.name
-
+//Firewall rule to allow ingress SSH traffic
+resource "google_compute_firewall" "allow_ssh" {
+  name        = "allow-ssh"
+  network     = google_compute_network.vpc.name
+  direction   = "INGRESS"
   allow {
     protocol = "tcp"
-    ports    = ["80", "8080", "3306"]
+    ports    = ["22"]
   }
-
-  source_tags = ["db", "database"]
-
-  depends_on = [
-    google_compute_network.vpc_network_wp_2
-  ]
-}
-
-//VPC Network Peering1 
-resource "google_compute_network_peering" "peering_wp_1" {
-  name         = "wp-to-db"
-  network      = google_compute_network.vpc_network_wp_1.id
-  peer_network = google_compute_network.vpc_network_wp_2.id
-
-  depends_on = [
-    google_compute_network.vpc_network_wp_1,
-    google_compute_network.vpc_network_wp_2
-  ]
-}
-
-//VPC Network Peering2
-resource "google_compute_network_peering" "peering_wp_2" {
-  name         = "db-to-wp"
-  network      = google_compute_network.vpc_network_wp_2.id
-  peer_network = google_compute_network.vpc_network_wp_1.id
-
-  depends_on = [
-    google_compute_network.vpc_network_wp_1,
-    google_compute_network.vpc_network_wp_2
-  ]
+  target_tags = ["ssh-enabled"]
 }
 
 //Configuring SQL Database instance
 resource "google_sql_database_instance" "sqldb_Instance_wp" {
-  name             = "sql2"
+  name             = "wp-sql-ha"
   database_version = "MYSQL_5_6"
   region           = var.region2
   root_password    = var.root_pass
+  depends_on       = [google_service_networking_connection.private_vpc_connection]
 
   settings {
-    tier = "db-f1-micro"
+    tier              = "db-f1-micro"
+    availability_type = "REGIONAL"
+    disk_size         = 10 
+    
+    backup_configuration {
+      enabled = true
+      binary_log_enabled = true
+    }
 
     ip_configuration {
-      ipv4_enabled = true
-
-      authorized_networks {
-        name  = "sqlnet"
-        value = "0.0.0.0/0"
-      }
+      ipv4_enabled    = false
+      private_network = google_compute_network.vpc.self_link
     }
   }
-
-  depends_on = [
-    google_compute_subnetwork.subnetwork_wp_2
-  ]
 }
+
 
 //Creating SQL Database
 resource "google_sql_database" "sql_db" {
@@ -174,19 +110,14 @@ resource "google_sql_user" "dbUser" {
 }
 
 //Creating Container Cluster
-resource "google_container_cluster" "gke_cluster_wp_1" {
+resource "google_container_cluster" "wp-cluster" {
   name     = "my-cluster"
   description = "My GKE Cluster"
   project = var.project_id
   location = var.region1
-  network = google_compute_network.vpc_network_wp_1.name
-  subnetwork = google_compute_subnetwork.subnetwork_wp_1.name
   remove_default_node_pool = true
   initial_node_count       = 1
 
-  depends_on = [
-    google_compute_subnetwork.subnetwork_wp_1
-  ]
 }
 
 //Creating Node Pool For Container Cluster
@@ -194,7 +125,7 @@ resource "google_container_node_pool" "nodepool_wp_1" {
   name       = "my-node-pool"
   project    = var.project_id
   location   = var.region1
-  cluster    = google_container_cluster.gke_cluster_wp_1.name
+  cluster    = google_container_cluster.wp-cluster.name
   node_count = 1
 
   node_config {
@@ -206,10 +137,6 @@ resource "google_container_node_pool" "nodepool_wp_1" {
     min_node_count = 1
     max_node_count = 3
   }
-
-  depends_on = [
-    google_container_cluster.gke_cluster_wp_1
-  ]
 }
 
 //Set Current Project in gcloud SDK
@@ -222,12 +149,12 @@ resource "null_resource" "set_gcloud_project" {
 //Configure Kubectl with Our GCP K8s Cluster
 resource "null_resource" "configure_kubectl" {
   provisioner "local-exec" {
-    command = "gcloud container clusters get-credentials ${google_container_cluster.gke_cluster_wp_1.name} --region ${google_container_cluster.gke_cluster_wp_1.location} --project ${google_container_cluster.gke_cluster_wp_1.project}"
+    command = "gcloud container clusters get-credentials ${google_container_cluster.wp-cluster.name} --region ${google_container_cluster.wp-cluster.location} --project ${google_container_cluster.wp-cluster.project}"
   }  
 
   depends_on = [
     null_resource.set_gcloud_project,
-    google_container_cluster.gke_cluster_wp_1
+    google_container_cluster.wp-cluster
   ]
 }
 
@@ -241,7 +168,7 @@ resource "kubernetes_deployment" "wp-dep" {
   }
 
   spec {
-    replicas = 1
+    replicas = 3
     selector {
       match_labels = {
         pod     = "wp"
@@ -293,7 +220,7 @@ resource "kubernetes_deployment" "wp-dep" {
 
   depends_on = [
     null_resource.set_gcloud_project,
-    google_container_cluster.gke_cluster_wp_1,
+    google_container_cluster.wp-cluster,
     google_container_node_pool.nodepool_wp_1,
     null_resource.configure_kubectl
   ]
