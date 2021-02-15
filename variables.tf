@@ -3,7 +3,7 @@
 //Project ID Variable
 variable "project_id" {
   type = string
-  default = "wordpress-terraform"
+  default = "gcp-wp-1"
 }
 
 //Region1 Variable
